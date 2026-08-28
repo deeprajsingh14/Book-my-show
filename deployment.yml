@@ -16,6 +16,6 @@ spec:
     spec:
       containers:
       - name: bms-container
-        image: kastrov/bms:latest  # Replace with your Docker image
+        image: 685459860804.dkr.ecr.us-east-1.amazonaws.com/bookmyshow:latest
         ports:
-        - containerPort: 3000  # Replace with the port your app runs on
+        - containerPort: 80
