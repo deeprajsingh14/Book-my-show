@@ -10,7 +10,6 @@
     deployment_name: "bms-app"
     container_name: "bms-container"
     ecr_repository: "685459860804.dkr.ecr.us-east-1.amazonaws.com/bookmyshow"
-    docker_image_tag: "4"
   tasks:
 
     - name: Configure kubectl for EKS cluster

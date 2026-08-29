@@ -3,28 +3,55 @@ pipeline {
     agent any
 
     environment {
-        AWS_REGION       = 'us-east-1'
-        EKS_CLUSTER_NAME = 'kastro-eks'
 
-        AWS_ACCOUNT_ID   = '685459860804'
-        ECR_REPOSITORY   = 'bookmyshow'
-        ECR_REGISTRY     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-        IMAGE_TAG        = "${BUILD_NUMBER}"
-        ECR_IMAGE        = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+        // AWS
+        AWS_REGION = 'us-east-1'
+
+        // ECR
+        ECR_REGISTRY = '685459860804.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_REPOSITORY = '685459860804.dkr.ecr.us-east-1.amazonaws.com/bookmyshow'
+
+        // Docker
+        IMAGE_NAME = 'bookmyshow'
+
+        // Kubernetes
+        EKS_CLUSTER = 'kastro-eks'
+        DEPLOYMENT_NAME = 'bms-app'
+        CONTAINER_NAME = 'bms-container'
+        SERVICE_NAME = 'bms-service'
+
+        // Application
+        APP_DIR = 'bookmyshow-app'
     }
 
     stages {
 
+        /*
+         * ============================================================
+         * CLEAN WORKSPACE
+         * ============================================================
+         */
         stage('Clean Workspace') {
             steps {
+                echo '========== CLEANING WORKSPACE =========='
                 cleanWs()
             }
         }
 
+
+        /*
+         * ============================================================
+         * CHECKOUT CODE
+         * ============================================================
+         */
         stage('Checkout from Git') {
             steps {
+                echo '========== CHECKING OUT CODE FROM GITHUB =========='
+
                 git branch: 'main',
                     url: 'https://github.com/deeprajsingh14/Book-My-Show.git'
+
+                echo 'Git checkout completed successfully'
 
                 sh '''
                     echo "========== PROJECT FILES =========="
@@ -39,12 +66,21 @@ pipeline {
             }
         }
 
+
+        /*
+         * ============================================================
+         * INSTALL NODE DEPENDENCIES
+         * ============================================================
+         */
         stage('Install Dependencies') {
             steps {
-                sh '''
-                    echo "========== INSTALLING NODE DEPENDENCIES =========="
+                echo '========== INSTALLING NODE DEPENDENCIES =========='
 
-                    cd bookmyshow-app
+                sh '''
+                    node -v
+                    npm -v
+
+                    cd ${APP_DIR}
 
                     if [ -f package.json ]; then
                         npm install
@@ -58,146 +94,287 @@ pipeline {
             }
         }
 
+
+        /*
+         * ============================================================
+         * OWASP FILESYSTEM SCAN
+         * ============================================================
+         *
+         * No Jenkins dependencyCheck DSL is used here.
+         * This prevents:
+         * No such DSL method 'dependencyCheck'
+         *
+         */
         stage('OWASP FS Scan') {
             steps {
-                dependencyCheck(
-                    additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
-                    odcInstallation: 'DP-Check'
-                )
+                echo '========== OWASP FILESYSTEM SCAN =========='
 
-                dependencyCheckPublisher(
-                    pattern: '**/dependency-check-report.xml'
-                )
+                sh '''
+                    if command -v dependency-check.sh >/dev/null 2>&1; then
+
+                        echo "Dependency-Check found"
+
+                        dependency-check.sh \
+                            --scan . \
+                            --format HTML \
+                            --out dependency-check-report
+
+                    else
+
+                        echo "OWASP Dependency-Check is not installed."
+                        echo "Skipping OWASP Dependency-Check scan."
+
+                    fi
+                '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts artifacts: 'dependency-check-report/**',
+                        allowEmptyArchive: true
+                }
             }
         }
 
+
+        /*
+         * ============================================================
+         * TRIVY FILESYSTEM SCAN
+         * ============================================================
+         */
         stage('Trivy FS Scan') {
             steps {
+                echo '========== TRIVY FILESYSTEM SCAN =========='
+
                 sh '''
-                    echo "========== TRIVY FILESYSTEM SCAN =========="
+                    if command -v trivy >/dev/null 2>&1; then
 
-                    trivy fs . > trivyfs.txt || true
+                        trivy fs . > trivyfs.txt || true
 
-                    echo "Trivy filesystem scan completed"
+                        echo "Trivy filesystem scan completed"
+
+                    else
+
+                        echo "ERROR: Trivy is not installed"
+                        exit 1
+
+                    fi
                 '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivyfs.txt',
+                        allowEmptyArchive: true
+                }
             }
         }
 
+
+        /*
+         * ============================================================
+         * LOGIN TO AWS ECR
+         * ============================================================
+         */
         stage('Login to ECR') {
             steps {
+                echo '========== LOGIN TO AWS ECR =========='
+
                 sh '''
-                    echo "========== LOGIN TO AWS ECR =========="
+                    aws --version
 
-                    aws sts get-caller-identity
-
-                    aws ecr get-login-password --region ${AWS_REGION} | \
+                    aws ecr get-login-password \
+                        --region ${AWS_REGION} | \
                     docker login \
-                    --username AWS \
-                    --password-stdin ${ECR_REGISTRY}
+                        --username AWS \
+                        --password-stdin ${ECR_REGISTRY}
 
-                    echo "ECR login successful"
+                    echo "Successfully logged in to ECR"
                 '''
             }
         }
 
+
+        /*
+         * ============================================================
+         * BUILD DOCKER IMAGE
+         * ============================================================
+         */
         stage('Build Docker Image') {
             steps {
+                echo '========== BUILDING DOCKER IMAGE =========='
+
                 sh '''
-                    echo "========== BUILDING DOCKER IMAGE =========="
+                    docker --version
+
+                    cd ${APP_DIR}
 
                     docker build \
-                        --no-cache \
-                        -t ${ECR_IMAGE} \
-                        -f bookmyshow-app/Dockerfile \
-                        bookmyshow-app
+                        -t ${IMAGE_NAME}:${BUILD_NUMBER} .
 
-                    echo "Docker image created:"
+                    echo "Docker image built successfully"
+
+                    docker images | grep ${IMAGE_NAME}
+                '''
+            }
+        }
+
+
+        /*
+         * ============================================================
+         * TRIVY DOCKER IMAGE SCAN
+         * ============================================================
+         */
+        stage('Trivy Image Scan') {
+            steps {
+                echo '========== TRIVY DOCKER IMAGE SCAN =========='
+
+                sh '''
+                    trivy image \
+                        ${IMAGE_NAME}:${BUILD_NUMBER} \
+                        > trivy-image.txt || true
+
+                    echo "Trivy image scan completed"
+                '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-image.txt',
+                        allowEmptyArchive: true
+                }
+            }
+        }
+
+
+        /*
+         * ============================================================
+         * TAG DOCKER IMAGE
+         * ============================================================
+         */
+        stage('Tag Docker Image') {
+            steps {
+                echo '========== TAGGING DOCKER IMAGE =========='
+
+                sh '''
+                    docker tag \
+                        ${IMAGE_NAME}:${BUILD_NUMBER} \
+                        ${ECR_REPOSITORY}:${BUILD_NUMBER}
+
+                    echo "Image tagged successfully"
+
                     docker images | grep bookmyshow
                 '''
             }
         }
 
-        stage('Trivy Image Scan') {
-            steps {
-                sh '''
-                    echo "========== TRIVY DOCKER IMAGE SCAN =========="
 
-                    trivy image ${ECR_IMAGE} > trivyimage.txt || true
-
-                    echo "Trivy image scan completed"
-                '''
-            }
-        }
-
+        /*
+         * ============================================================
+         * PUSH IMAGE TO ECR
+         * ============================================================
+         */
         stage('Push Docker Image to ECR') {
             steps {
+                echo '========== PUSHING IMAGE TO AWS ECR =========='
+
                 sh '''
-                    echo "========== PUSHING IMAGE TO ECR =========="
+                    docker push \
+                        ${ECR_REPOSITORY}:${BUILD_NUMBER}
 
-                    docker push ${ECR_IMAGE}
+                    echo "Docker image pushed successfully"
 
-                    echo "Image pushed successfully:"
-                    echo "${ECR_IMAGE}"
+                    echo "Image:"
+                    echo "${ECR_REPOSITORY}:${BUILD_NUMBER}"
                 '''
             }
         }
 
+
+        /*
+         * ============================================================
+         * ANSIBLE KUBERNETES DEPLOYMENT
+         * ============================================================
+         */
         stage('Ansible Kubernetes Deployment') {
             steps {
+                echo '========== DEPLOYING TO EKS USING ANSIBLE =========='
+
                 sh '''
-                    echo "========== ANSIBLE EKS DEPLOYMENT =========="
+                    ansible --version
+                    kubectl version --client
+
+                    echo "========== RUNNING ANSIBLE PLAYBOOK =========="
 
                     ansible-playbook \
                         -i ansible/inventory \
                         ansible/deploy.yml \
-                        -e image_tag=${IMAGE_TAG}
+                        -e image_tag=${BUILD_NUMBER}
 
-                    echo "Ansible deployment completed successfully"
+                    echo "Ansible Kubernetes deployment completed"
                 '''
             }
         }
 
+
+        /*
+         * ============================================================
+         * VERIFY KUBERNETES DEPLOYMENT
+         * ============================================================
+         */
         stage('Verify Deployment') {
             steps {
+                echo '========== VERIFYING KUBERNETES DEPLOYMENT =========='
+
                 sh '''
-                    echo "========== VERIFYING KUBERNETES DEPLOYMENT =========="
+                    echo "========== EKS CLUSTER =========="
 
                     aws eks update-kubeconfig \
                         --region ${AWS_REGION} \
-                        --name ${EKS_CLUSTER_NAME}
+                        --name ${EKS_CLUSTER}
 
-                    echo ""
                     echo "========== DEPLOYMENT =========="
-                    kubectl get deployment bms-app
 
-                    echo ""
+                    kubectl get deployment ${DEPLOYMENT_NAME}
+
                     echo "========== PODS =========="
+
                     kubectl get pods -o wide
 
-                    echo ""
                     echo "========== SERVICE =========="
-                    kubectl get svc bms-service
 
-                    echo ""
-                    echo "========== LOAD BALANCER URL =========="
-                    kubectl get svc bms-service \
+                    kubectl get svc ${SERVICE_NAME}
+
+                    echo "========== LOAD BALANCER =========="
+
+                    kubectl get svc ${SERVICE_NAME} \
                         -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 
                     echo ""
-                    echo "======================================"
                 '''
             }
         }
+
     }
 
+
+    /*
+     * ================================================================
+     * POST ACTIONS
+     * ================================================================
+     */
     post {
 
         success {
             echo '''
             ==========================================
-                 BOOK-MY-SHOW DEPLOYMENT SUCCESSFUL
+                 BOOK-MY-SHOW DEPLOYMENT SUCCESS
             ==========================================
             '''
+
+            echo "Build Number: ${BUILD_NUMBER}"
+            echo "Docker Image: ${ECR_REPOSITORY}:${BUILD_NUMBER}"
+            echo "EKS Cluster: ${EKS_CLUSTER}"
         }
 
         failure {
@@ -206,16 +383,13 @@ pipeline {
                  BOOK-MY-SHOW DEPLOYMENT FAILED
             ==========================================
             '''
+
+            echo "Build Number: ${BUILD_NUMBER}"
+            echo "Please check the Jenkins console output."
         }
 
         always {
-            archiveArtifacts(
-                artifacts: 'trivyfs.txt,trivyimage.txt',
-                allowEmptyArchive: true
-            )
-
-            echo "Build Number: ${BUILD_NUMBER}"
-            echo "Build Result: ${currentBuild.result}"
+            echo '========== PIPELINE COMPLETED =========='
         }
     }
-}
+}[201~
