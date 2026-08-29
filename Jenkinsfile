@@ -392,4 +392,4 @@ pipeline {
             echo '========== PIPELINE COMPLETED =========='
         }
     }
-}[201~
+}
