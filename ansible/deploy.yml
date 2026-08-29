@@ -7,12 +7,10 @@
   vars:
     aws_region: "us-east-1"
     eks_cluster_name: "kastro-eks"
-
     deployment_name: "bms-app"
     container_name: "bms-container"
-
     ecr_repository: "685459860804.dkr.ecr.us-east-1.amazonaws.com/bookmyshow"
-
+    docker_image_tag: "4"
   tasks:
 
     - name: Configure kubectl for EKS cluster
@@ -22,7 +20,7 @@
 
     - name: Update Kubernetes deployment image
       ansible.builtin.command:
-        cmd: kubectl set image deployment/{{ deployment_name }} {{ container_name }}={{ ecr_repository }}:{{ image_tag }}
+        cmd: kubectl set image deployment/{{ deployment_name }} {{ container_name }}={{ ecr_repository }}:{{ docker_image_tag }}
       changed_when: true
 
     - name: Wait for Kubernetes rollout

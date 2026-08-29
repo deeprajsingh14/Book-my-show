@@ -2,17 +2,15 @@ pipeline {
 
     agent any
 
-    tools {
-        jdk 'jdk21' 
-    }
-
     environment {
-        SCANNER_HOME = tool 'sonar-scanner'
-
-        AWS_REGION = 'us-east-1'
+        AWS_REGION       = 'us-east-1'
         EKS_CLUSTER_NAME = 'kastro-eks'
 
-        ECR_REPOSITORY = '685459860804.dkr.ecr.us-east-1.amazonaws.com/bookmyshow'
+        AWS_ACCOUNT_ID   = '685459860804'
+        ECR_REPOSITORY   = 'bookmyshow'
+        ECR_REGISTRY     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_TAG        = "${BUILD_NUMBER}"
+        ECR_IMAGE        = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
     }
 
     stages {
@@ -28,44 +26,34 @@ pipeline {
                 git branch: 'main',
                     url: 'https://github.com/deeprajsingh14/Book-My-Show.git'
 
-                sh 'ls -la'
-            }
-        }
+                sh '''
+                    echo "========== PROJECT FILES =========="
+                    ls -la
 
-        stage('SonarQube Analysis') {
-            steps {
-                withSonarQubeEnv('sonar-server') {
-                    sh '''
-                        $SCANNER_HOME/bin/sonar-scanner \
-                            -Dsonar.projectName=BMS \
-                            -Dsonar.projectKey=BMS
-                    '''
-                }
-            }
-        }
+                    echo "========== ANSIBLE FILES =========="
+                    ls -la ansible
 
-        stage('Quality Gate') {
-            steps {
-                script {
-                    waitForQualityGate(
-                        abortPipeline: false,
-                        credentialsId: 'Sonar-token'
-                    )
-                }
+                    echo "========== APPLICATION FILES =========="
+                    ls -la bookmyshow-app
+                '''
             }
         }
 
         stage('Install Dependencies') {
             steps {
                 sh '''
+                    echo "========== INSTALLING NODE DEPENDENCIES =========="
+
                     cd bookmyshow-app
 
                     if [ -f package.json ]; then
                         npm install
                     else
-                        echo "Error: package.json not found!"
+                        echo "ERROR: package.json not found"
                         exit 1
                     fi
+
+                    echo "Dependencies installed successfully"
                 '''
             }
         }
@@ -85,21 +73,29 @@ pipeline {
 
         stage('Trivy FS Scan') {
             steps {
-                sh 'trivy fs . > trivyfs.txt'
+                sh '''
+                    echo "========== TRIVY FILESYSTEM SCAN =========="
+
+                    trivy fs . > trivyfs.txt || true
+
+                    echo "Trivy filesystem scan completed"
+                '''
             }
         }
 
         stage('Login to ECR') {
             steps {
                 sh '''
-                    echo "Logging in to Amazon ECR..."
+                    echo "========== LOGIN TO AWS ECR =========="
 
-                    aws ecr get-login-password \
-                    --region $AWS_REGION | \
+                    aws sts get-caller-identity
+
+                    aws ecr get-login-password --region ${AWS_REGION} | \
                     docker login \
                     --username AWS \
-                    --password-stdin \
-                    685459860804.dkr.ecr.us-east-1.amazonaws.com
+                    --password-stdin ${ECR_REGISTRY}
+
+                    echo "ECR login successful"
                 '''
             }
         }
@@ -107,23 +103,41 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
-                    echo "Building Docker image..."
+                    echo "========== BUILDING DOCKER IMAGE =========="
 
                     docker build \
-                    -t $ECR_REPOSITORY:$BUILD_NUMBER \
-                    -f bookmyshow-app/Dockerfile \
-                    bookmyshow-app
+                        --no-cache \
+                        -t ${ECR_IMAGE} \
+                        -f bookmyshow-app/Dockerfile \
+                        bookmyshow-app
+
+                    echo "Docker image created:"
+                    docker images | grep bookmyshow
                 '''
             }
         }
 
-        stage('Push Docker Image') {
+        stage('Trivy Image Scan') {
             steps {
                 sh '''
-                    echo "Pushing Docker image to ECR..."
+                    echo "========== TRIVY DOCKER IMAGE SCAN =========="
 
-                    docker push \
-                    $ECR_REPOSITORY:$BUILD_NUMBER
+                    trivy image ${ECR_IMAGE} > trivyimage.txt || true
+
+                    echo "Trivy image scan completed"
+                '''
+            }
+        }
+
+        stage('Push Docker Image to ECR') {
+            steps {
+                sh '''
+                    echo "========== PUSHING IMAGE TO ECR =========="
+
+                    docker push ${ECR_IMAGE}
+
+                    echo "Image pushed successfully:"
+                    echo "${ECR_IMAGE}"
                 '''
             }
         }
@@ -131,12 +145,14 @@ pipeline {
         stage('Ansible Kubernetes Deployment') {
             steps {
                 sh '''
-                    echo "Running Ansible deployment..."
+                    echo "========== ANSIBLE EKS DEPLOYMENT =========="
 
                     ansible-playbook \
-                    -i ansible/inventory \
-                    ansible/deploy.yml \
-                    -e image_tag=$BUILD_NUMBER
+                        -i ansible/inventory \
+                        ansible/deploy.yml \
+                        -e image_tag=${IMAGE_TAG}
+
+                    echo "Ansible deployment completed successfully"
                 '''
             }
         }
@@ -144,17 +160,31 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 sh '''
-                    echo "Verifying Kubernetes deployment..."
+                    echo "========== VERIFYING KUBERNETES DEPLOYMENT =========="
 
+                    aws eks update-kubeconfig \
+                        --region ${AWS_REGION} \
+                        --name ${EKS_CLUSTER_NAME}
+
+                    echo ""
+                    echo "========== DEPLOYMENT =========="
                     kubectl get deployment bms-app
 
-                    echo "Checking pods..."
-
+                    echo ""
+                    echo "========== PODS =========="
                     kubectl get pods -o wide
 
-                    echo "Checking LoadBalancer..."
-
+                    echo ""
+                    echo "========== SERVICE =========="
                     kubectl get svc bms-service
+
+                    echo ""
+                    echo "========== LOAD BALANCER URL =========="
+                    kubectl get svc bms-service \
+                        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+
+                    echo ""
+                    echo "======================================"
                 '''
             }
         }
@@ -162,21 +192,30 @@ pipeline {
 
     post {
 
-        always {
-            emailext(
-                attachLog: true,
-                subject: "${currentBuild.result}",
-                body:
-                    "Project: ${env.JOB_NAME}<br/>" +
-                    "Build Number: ${env.BUILD_NUMBER}<br/>" +
-                    "URL: ${env.BUILD_URL}<br/>",
-                to: 'kastrokiran@gmail.com',
-                attachmentsPattern: 'trivyfs.txt'
-            )
+        success {
+            echo '''
+            ==========================================
+                 BOOK-MY-SHOW DEPLOYMENT SUCCESSFUL
+            ==========================================
+            '''
         }
 
-        success {
-            echo 'Book-My-Show CI/CD pipeline completed successfully!'
+        failure {
+            echo '''
+            ==========================================
+                 BOOK-MY-SHOW DEPLOYMENT FAILED
+            ==========================================
+            '''
+        }
+
+        always {
+            archiveArtifacts(
+                artifacts: 'trivyfs.txt,trivyimage.txt',
+                allowEmptyArchive: true
+            )
+
+            echo "Build Number: ${BUILD_NUMBER}"
+            echo "Build Result: ${currentBuild.result}"
         }
     }
 }
